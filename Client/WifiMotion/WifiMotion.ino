@@ -19,6 +19,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <SD.h>
 
 /* Type definition */
 
@@ -27,9 +28,18 @@
 #define MAX_CONNECTION_NUM    5
 #define STATUS_LED_PIN        13
 
+#define RECORD_SD_CARD        1   // 0 send directly using wifi
+
 /* local type definition */
 
 /* variables */
+
+// SD card
+const int chipSelect = 4;
+char dataLogname[256] = "datalog.txt";
+unsigned long wifi_sd_period_ms = 10000; 
+unsigned long previousSDMillis;
+
 
 char ssid[] = "Tufor";     //  your network SSID (name)
 char pass[] = "njqxrkqr";    // your network password
@@ -73,8 +83,21 @@ void setup() {
   my3IMU.init(true);
   
   // Sync device to hub
-  sync_device();
-    
+  if (RECORD_SD_CARD)
+  {
+    if (!SD.begin(chipSelect))
+    {
+      Serial.println("Card failed or not present");
+     return; 
+    }
+    Serial.println("Card was initialized");
+    previousSDMillis = millis();
+  }
+  else
+  {
+    sync_device();
+  }
+  
   // initialize variables related to sampling
   init_measurements();
   Serial.println(F("Measurement module initialized"));
@@ -113,14 +136,167 @@ void loop() {
   // Send data via wifi when it is time for it
   if (num_samples >= MAX_NUM_SAMPLES)   // or some other criteria like cat at rest
   {
-    Serial.println(F("Sending measurements"));
     blink_led(2,250);
     digitalWrite(STATUS_LED_PIN, HIGH);
-    send_measurements(0);
+    
+    if (RECORD_SD_CARD)
+    {
+      Serial.println(F("Saving measurements"));
+      save_measurements(0);
+    }
+    else
+    {
+      Serial.println(F("Sending measurements"));
+      send_measurements(0);
+    }
     blink_led(2,250);
     my3IMU.init(true);
     Serial.println(F("    Done"));
   }     
+  
+  if (RECORD_SD_CARD)
+  {
+    if ((unsigned long)(millis() - previousSDMillis) > wifi_sd_period_ms)
+    {
+      // record on sd card
+      Serial.println("Sending SD card data via Wifi");
+      send_SDdata2WIFI();
+      previousSDMillis = millis();
+    }
+    
+  }
+}
+
+// Save measurements in SD card
+void save_measurements(int send_num_samples) {
+  int i, max_i = send_num_samples;
+  char data_aux[32]; // the max number is 4,294,967,295 which has 10 characters + 1 for the termination character
+  int keepconnection = 1;
+  char filename[256] = "datalog.txt";
+  
+  // Exit if nothing to send
+  if (num_samples == 0)
+  {
+    return;
+  }
+  
+  File dataFile = SD.open(dataLogname, FILE_WRITE);
+  
+  if (!dataFile)
+  {
+    Serial.println("Error opening");  // %s",dataLogname);
+    return;
+  }
+  
+  if (num_samples < send_num_samples || send_num_samples <= 0)
+    max_i = num_samples;
+    
+  for (i=0; i<max_i; i++)
+  {
+    if (i == max_i-1)
+      keepconnection = 0;
+    //sprintf(data_aux,"sample %d, remaining %d",i+1, num_samples);
+    //Serial.println(data_aux);
+    create_data_wifi_str(&data_buffer[sent_data_idx]);
+    
+    if (header_str != NULL)
+      dataFile.print(header_str);
+    dataFile.print(data_str);  
+    if (calc_data_str != NULL)
+      dataFile.print(calc_data_str);
+    dataFile.println();
+    
+    increase_data_ptr(&sent_data_idx);
+    num_samples--;
+  }
+  
+  dataFile.close();
+}
+
+// Send the data of the SD card through wifi
+void send_SDdata2WIFI() { 
+  char sd_str[512];
+  int len = 0;
+  File dataFile = SD.open(dataLogname, FILE_READ);
+  
+  if (!dataFile)
+  {
+    Serial.println("Error opening");  // %s",dataLogname);
+    return;
+  }
+  
+  // Connect to server
+  if (!client.connected())
+  {
+    //Serial.println("reconnecting to server");
+    len = MAX_CONNECTION_NUM;
+    while (client.connect(ip_server, 80) == 0 && len>0) {
+      len--;
+    }
+  } 
+  if (!client.connected())
+  {
+    Serial.println("Unable to connect to server");
+    return;
+  }
+  
+  // read from the file until there's nothing else in it:
+  while (dataFile.available()) {
+    // Read SD card
+    sd_str = dataFile.read();
+    
+    // Send lines through wifi
+    Serial.write(sd_str);
+      
+    len = strlen(sd_str);
+    
+    // Create script line from input
+    sprintf(script_line,"POST %s HTTP/1.1", script);
+    sprintf(host_line,"Host: %s", ip_server_host);
+    
+    // Make a HTTP request:
+    client.flush();
+    client.println(script_line);
+    client.println(host_line);
+    client.println("User-Agent: ArduinoWifi/1.1");
+    client.println("Content-Type: application/x-www-form-urlencoded");  
+    if (keepConnection)
+    {
+      client.println("Connection: Keep-Alive");
+      client.println("Keep-Alive: timeout=10, max=5");
+    }
+    else
+    {
+      client.println("Connection: close");
+    }
+    client.print("Content-Length: "); 
+    client.println(len); 
+    client.println();
+    sendContent(sd_str);
+    client.println();
+    
+    while (!waitResponse("HTTP/1.1 200 OK", len) && len>0)
+    {
+      len--;
+    }
+  }
+  
+  if (!keepConnection)
+  {
+    client.flush();
+    if (!client.connected())
+    {
+      client.stop();
+      client.flush();
+      //Serial.println("Closed connection");
+    }
+  }
+  
+  // Close SD card file
+  dataFile.close();
+  
+  // Remove the existing data
+  SD.remove(dataLogname);
 }
 
 // Sync the shield to the server. Currently just checking the shield and connection status

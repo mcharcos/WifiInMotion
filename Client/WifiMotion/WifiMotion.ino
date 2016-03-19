@@ -28,7 +28,8 @@
 #define MAX_CONNECTION_NUM    5
 #define STATUS_LED_PIN        13
 
-#define RECORD_SD_CARD        1   // 0 send directly using wifi
+#define RECORD_SD_CARD           1   // 0 send directly using wifi
+#define SD_FILE_RECORDS_MAX      10000
 
 /* local type definition */
 
@@ -36,8 +37,10 @@
 
 // SD card
 const int chipSelect = 4;
-char dataLogname[256] = "datalog.txt";
-unsigned long wifi_sd_period_ms = 10000; 
+char dataLogRoot[8] = "dcat";
+char dataLogExt[5] = "txt";
+char dataLogname[16] = "";
+unsigned long wifi_sd_period_ms = 240000; 
 unsigned long previousSDMillis;
 
 
@@ -57,11 +60,12 @@ data_sensor_t data_buffer[MAX_NUM_SAMPLES];
 data_calc_t calc_buffer[MAX_NUM_SAMPLES];
 
 // Strings to be sent via wifi
-char header_str[256];
-char data_str[512];
-char calc_data_str[256];
+char header_str[256] = "";
+char data_str[512] = "";
+char calc_data_str[256] = "";
 
 int num_samples = 0, current_data_idx, sent_data_idx;
+int num_sd_files, current_sd_file_idx, sent_sd_files_idx;
 unsigned long previousMillis;
 
 // Set the FreeIMU object
@@ -92,6 +96,10 @@ void setup() {
     }
     Serial.println("Card was initialized");
     previousSDMillis = millis();
+    current_sd_file_idx = 0;
+    num_sd_files = 0;
+    sent_sd_files_idx = 0;
+    cmd = '.';
   }
   else
   {
@@ -114,18 +122,21 @@ void loop() {
   if ((unsigned long)(millis() - previousMillis) >= sampling_period_ms &&
       num_samples < MAX_NUM_SAMPLES)
   {
+    Serial.println("Recording measurement");
     record_measurement();
   } 
-  
-  
-  // Take measurements each period 
-  /*
-  if ((unsigned long)(millis() - previousMillis) < sampling_period_ms/2)
+  else
   {
-    // record on sd card
-    send_measurement(1);
+    if (RECORD_SD_CARD)
+    {
+      blink_led(2,250);
+      digitalWrite(STATUS_LED_PIN, HIGH);
+    
+      Serial.println(F("Saving 1 measurement"));
+      save_measurements(1);
+    }
+    
   }
-  */
   
   // millis is a 4 byte number so it cycles every ~49 days since arduino started
   // we count this cycle to recorded to the return string as the best timestamp
@@ -148,20 +159,30 @@ void loop() {
     {
       Serial.println(F("Sending measurements"));
       send_measurements(0);
+      my3IMU.init(true);
     }
     blink_led(2,250);
-    my3IMU.init(true);
     Serial.println(F("    Done"));
   }     
   
   if (RECORD_SD_CARD)
   {
-    if ((unsigned long)(millis() - previousSDMillis) > wifi_sd_period_ms)
+    if(Serial.available()) {
+      cmd = Serial.read();
+    }
+    if ((unsigned long)(millis() - previousSDMillis) > wifi_sd_period_ms || cmd == 'w')
     {
+      blink_led(10,250);
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      
       // record on sd card
       Serial.println("Sending SD card data via Wifi");
-      send_SDdata2WIFI();
+      send_SDdata2WIFI(num_sd_files);
+      
+      blink_led(10,250);
+      my3IMU.init(true);
       previousSDMillis = millis();
+      cmd = '.';
     }
     
   }
@@ -170,21 +191,17 @@ void loop() {
 // Save measurements in SD card
 void save_measurements(int send_num_samples) {
   int i, max_i = send_num_samples;
-  char data_aux[32]; // the max number is 4,294,967,295 which has 10 characters + 1 for the termination character
-  int keepconnection = 1;
-  char filename[256] = "datalog.txt";
+  //char data_aux[32]; // the max number is 4,294,967,295 which has 10 characters + 1 for the termination character
+  File dataFile;
   
   // Exit if nothing to send
-  if (num_samples == 0)
+  if (num_sd_files >= SD_FILE_RECORDS_MAX)
   {
+    Serial.println("WARNING: Exceeded max files. Overwritting files");
     return;
   }
-  
-  File dataFile = SD.open(dataLogname, FILE_WRITE);
-  
-  if (!dataFile)
+  if (num_samples == 0)
   {
-    Serial.println("Error opening");  // %s",dataLogname);
     return;
   }
   
@@ -193,110 +210,122 @@ void save_measurements(int send_num_samples) {
     
   for (i=0; i<max_i; i++)
   {
-    if (i == max_i-1)
-      keepconnection = 0;
+    
+    sprintf(dataLogname,"%s%01d.%s",dataLogRoot,current_sd_file_idx,dataLogExt); 
+    Serial.print("Saving data in file ");
+    Serial.println(dataLogname);
+    SD.remove(dataLogname);  
+    dataFile = SD.open(dataLogname, FILE_WRITE);
+    
+    if (!dataFile)
+    {
+      Serial.println("Error opening");  // %s",dataLogname);
+      return;
+    }
+    
     //sprintf(data_aux,"sample %d, remaining %d",i+1, num_samples);
     //Serial.println(data_aux);
-    create_data_wifi_str(&data_buffer[sent_data_idx]);
+    create_data_wifi_str(sent_data_idx);
     
     if (header_str != NULL)
-      dataFile.print(header_str);
-    dataFile.print(data_str);  
+    {
+      //Serial.print("Header: ");
+      //Serial.println(header_str);
+      dataFile.write(header_str);
+    }
+    dataFile.write(data_str);  
+    //Serial.print("Raw: ");
+    //Serial.println(data_str);
     if (calc_data_str != NULL)
-      dataFile.print(calc_data_str);
+    {
+      //Serial.print("Calculations: ");
+      //Serial.println(calc_data_str);
+      dataFile.write(calc_data_str);
+    }
     dataFile.println();
     
-    increase_data_ptr(&sent_data_idx);
+    dataFile.close();
+    
+    // Update buffer index info
     num_samples--;
+    increase_data_ptr(&sent_data_idx);
+    
+    // Update SD card file index info
+    num_sd_files++;
+    increase_sd_file_idx(&current_sd_file_idx);
   }
   
-  dataFile.close();
 }
 
-// Send the data of the SD card through wifi
-void send_SDdata2WIFI() { 
-  char sd_str[512];
-  int len = 0;
-  File dataFile = SD.open(dataLogname, FILE_READ);
+// Sends one line of data of the SD card through wifi
+// returns 0 if no error, -1 if error or 1 if no data to be sent
+int send_SDdata2WIFI(int send_num_samples) { 
+  int len = 0, i, max_i = send_num_samples;
+  char *data_ptr;
+  File dataFile;
   
-  if (!dataFile)
+  // Check if there is a data to be sent
+  if (num_sd_files <= 0)
   {
-    Serial.println("Error opening");  // %s",dataLogname);
-    return;
+    Serial.println("No data file to be sent");
+    return 1; 
   }
   
-  // Connect to server
-  if (!client.connected())
+  if (num_sd_files < send_num_samples || send_num_samples <= 0)
+    max_i = num_sd_files;
+    
+  Serial.print("Sending ");
+  Serial.print(max_i);
+  Serial.println(" files via WIFI");
+  for (i=0; i<max_i; i++)
   {
-    //Serial.println("reconnecting to server");
-    len = MAX_CONNECTION_NUM;
-    while (client.connect(ip_server, 80) == 0 && len>0) {
-      len--;
+    sprintf(dataLogname,"%s%01d.%s",dataLogRoot,sent_sd_files_idx,dataLogExt); 
+    Serial.print(i+1);
+    Serial.print("/");
+    Serial.print(max_i);
+    Serial.print(" Sending ");
+    Serial.println(dataLogname);
+    dataFile = SD.open(dataLogname, FILE_READ);
+    
+    if (!dataFile)
+    {
+      Serial.println("Error opening");  // %s",dataLogname);
+      return -1;
     }
-  } 
-  if (!client.connected())
-  {
-    Serial.println("Unable to connect to server");
-    return;
+    
+    // Read line in SD card file
+    if (!dataFile.available())
+    {
+      Serial.println("No available data to be sent");
+      return -1; 
+    }
+    
+    data_ptr = data_str;
+    while (dataFile.available()) {
+      *data_ptr++ = dataFile.read();
+    }
+    
+    // Close SD card file
+    dataFile.close();
+    
+    // Connect to server and send the data
+    sync_device();
+    sendData2Wifi("/test1.php", 0);
+   
+    // Remove file if succesfully received
+    /*if (!SD.begin(chipSelect))
+    {
+      Serial.println("Card failed or not present");
+      return -1; 
+    }*/
+    Serial.print("Removing file ");
+    Serial.println(dataLogname);
+    //SD.remove(dataLogname);  
+    increase_sd_file_idx(&sent_sd_files_idx);
+    num_sd_files--;
   }
   
-  // read from the file until there's nothing else in it:
-  while (dataFile.available()) {
-    // Read SD card
-    sd_str = dataFile.read();
-    
-    // Send lines through wifi
-    Serial.write(sd_str);
-      
-    len = strlen(sd_str);
-    
-    // Create script line from input
-    sprintf(script_line,"POST %s HTTP/1.1", script);
-    sprintf(host_line,"Host: %s", ip_server_host);
-    
-    // Make a HTTP request:
-    client.flush();
-    client.println(script_line);
-    client.println(host_line);
-    client.println("User-Agent: ArduinoWifi/1.1");
-    client.println("Content-Type: application/x-www-form-urlencoded");  
-    if (keepConnection)
-    {
-      client.println("Connection: Keep-Alive");
-      client.println("Keep-Alive: timeout=10, max=5");
-    }
-    else
-    {
-      client.println("Connection: close");
-    }
-    client.print("Content-Length: "); 
-    client.println(len); 
-    client.println();
-    sendContent(sd_str);
-    client.println();
-    
-    while (!waitResponse("HTTP/1.1 200 OK", len) && len>0)
-    {
-      len--;
-    }
-  }
-  
-  if (!keepConnection)
-  {
-    client.flush();
-    if (!client.connected())
-    {
-      client.stop();
-      client.flush();
-      //Serial.println("Closed connection");
-    }
-  }
-  
-  // Close SD card file
-  dataFile.close();
-  
-  // Remove the existing data
-  SD.remove(dataLogname);
+  return 0;
 }
 
 // Sync the shield to the server. Currently just checking the shield and connection status
@@ -426,28 +455,28 @@ void record_measurement() {
 
 // Creates the string from the input data sensor type
 // Assumes the buffer is large enough
-void create_data_wifi_str(data_sensor_t *data_sensor)
+void create_data_wifi_str(int idx)
 {
   
   //Check array size
   //sprintf(data, "tc1=%ul&tm1=%ul&tc2=%ul&tm2=%ul&acc1=%d&acc2=%d&acc3=%d&gyro1=%d&gyro2=%d&gyro3=%d&magn1=%d&magn2=%d&magn3=%d&temp1=%d&press1=%d&quat1=%ld&quat2=%ld&quat3=%ld&quat4=%ld&quat5=%ld&quat6=%ld&quat7=%ld&eurl1=%ld&eurl2=%ld&eurl3=%ld&yaw1=%ld&yaw2=%ld&yaw3=%ld&SSID=%s&dBm=%ld", 
   
   sprintf(header_str, "tc1=%lu&tm1=%lu&tc2=%lu&tm2=%lu&",
-    header_buffer->tc1, header_buffer->tm1, header_buffer->tc2, header_buffer->tm2);
+    header_buffer[idx].tc1, header_buffer[idx].tm1, header_buffer[idx].tc2, header_buffer[idx].tm2);
   
   sprintf(data_str, "acc1=%d&acc2=%d&acc3=%d&gyro1=%d&gyro2=%d&gyro3=%d&magn1=%d&magn2=%d&magn3=%d&temp1=%d&press1=%d&dBm=%ld&SSID=",
-    data_sensor->acc1,data_sensor->acc2,data_sensor->acc3,
-    data_sensor->gyro1,data_sensor->gyro2,data_sensor->gyro3,
-    data_sensor->magn1,data_sensor->magn2,data_sensor->magn3,
-    data_sensor->temp1,data_sensor->press1,data_sensor->dBm);
+    data_buffer[idx].acc1,data_buffer[idx].acc2,data_buffer[idx].acc3,
+    data_buffer[idx].gyro1,data_buffer[idx].gyro2,data_buffer[idx].gyro3,
+    data_buffer[idx].magn1,data_buffer[idx].magn2,data_buffer[idx].magn3,
+    data_buffer[idx].temp1,data_buffer[idx].press1,data_buffer[idx].dBm);
   strcat(data_str,ssid);
   //sprintf(data_str,"567890123456789012345678901234567899012345678901234567890123456789012345678901234567890"); 
   
   sprintf(calc_data_str, "&quat1=%ld&quat2=%ld&quat3=%ld&quat4=%ld&quat5=%ld&quat6=%ld&quat7=%ld&eurl1=%ld&eurl2=%ld&eurl3=%ld&yaw1=%ld&yaw2=%ld&yaw3=%ld",
-    calc_buffer->quat1, calc_buffer->quat2, calc_buffer->quat3, calc_buffer->quat4,
-    calc_buffer->quat5, calc_buffer->quat6, calc_buffer->quat7,
-    calc_buffer->eurl1, calc_buffer->eurl2, calc_buffer->eurl3,
-    calc_buffer->yaw1,  calc_buffer->yaw2,  calc_buffer->yaw3);
+    calc_buffer[idx].quat1, calc_buffer[idx].quat2, calc_buffer[idx].quat3, calc_buffer[idx].quat4,
+    calc_buffer[idx].quat5, calc_buffer[idx].quat6, calc_buffer[idx].quat7,
+    calc_buffer[idx].eurl1, calc_buffer[idx].eurl2, calc_buffer[idx].eurl3,
+    calc_buffer[idx].yaw1,  calc_buffer[idx].yaw2,  calc_buffer[idx].yaw3);
 }
 
 
@@ -513,12 +542,10 @@ void sendData2Wifi(char *script, int keepConnection)
     Serial.println("Unable to connect to server");
     return;
   }
-  //Serial.println("connected to server");
+  Serial.println("connected to server");
   
-  if (header_str != NULL)
-    len_header = strlen(header_str);
-  if (calc_data_str != NULL)
-    len_calc = strlen(calc_data_str);
+  len_header = strlen(header_str);
+  len_calc = strlen(calc_data_str);
   len = len_data + len_header + len_calc;
   
   // Create script line from input
@@ -544,10 +571,10 @@ void sendData2Wifi(char *script, int keepConnection)
   client.println(len); 
   client.println();
   
-  if (header_str != NULL)
+  if (len_header != 0)
     sendContent(header_str);
   sendContent(data_str);  // This is b/c the max size with client.print is around 90
-  if (calc_data_str != NULL)
+  if (len_calc != 0)
     sendContent(calc_data_str);
   client.println();
   
@@ -610,7 +637,7 @@ void send_measurements(int send_num_samples) {
       keepconnection = 0;
     //sprintf(data_aux,"sample %d, remaining %d",i+1, num_samples);
     //Serial.println(data_aux);
-    create_data_wifi_str(&data_buffer[sent_data_idx]);
+    create_data_wifi_str(sent_data_idx);
     sendData2Wifi("/test1.php", 0);
     
     increase_data_ptr(&sent_data_idx);
@@ -695,6 +722,21 @@ void blink_led(int num_times, int dtime_ms) {
   }
 }
 
+
+// Increases the index of the file in SD card. Set to 0 if it reached the maximum
+void increase_sd_file_idx(int *idx) {
+    (*idx)++;
+    if (*idx >= SD_FILE_RECORDS_MAX)
+      *idx = 0; 
+}
+
+// Decreases the index of the file in SD card. Set to end if it reached the minimum
+void decrease_sd_File_idx(int *idx) {
+    (*idx)--;
+    if (*idx < 0)
+      *idx = SD_FILE_RECORDS_MAX-1; 
+}
+
 // Increases the data pointer of the sample buffer. Set to 0 if it reached the maximum
 void increase_data_ptr(int *idx) {
     (*idx)++;
@@ -708,4 +750,5 @@ void decrease_data_ptr(int *idx) {
     if (*idx < 0)
       *idx = MAX_NUM_SAMPLES-1; 
 }
+
 

@@ -310,7 +310,7 @@ int send_SDdata2WIFI(int send_num_samples) {
     
     // Connect to server and send the data
     sync_device();
-    sendData2Wifi("/test1.php", 0);
+    sendData2Wifi("/add.php", 0);
    
     // Remove file if succesfully received
     /*if (!SD.begin(chipSelect))
@@ -638,7 +638,7 @@ void send_measurements(int send_num_samples) {
     //sprintf(data_aux,"sample %d, remaining %d",i+1, num_samples);
     //Serial.println(data_aux);
     create_data_wifi_str(sent_data_idx);
-    sendData2Wifi("/test1.php", 0);
+    sendData2Wifi("/add.php", 0);
     
     increase_data_ptr(&sent_data_idx);
     num_samples--;
